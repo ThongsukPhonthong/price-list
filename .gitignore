@@ -1,0 +1,7 @@
+output_pdf/
+log.txt
+links.txt
+run.bat
+__pycache__/
+*.py[cod]
+.venv/
