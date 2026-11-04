@@ -7,11 +7,10 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-import fitz
+import pymupdf
 import requests
 
 
@@ -23,7 +22,7 @@ SHEETS = {
     "grocery": "1002",
     "squid": "1636193476",
 }
-BASE_URL = "https://USERNAME.github.io/price-list"
+BASE_URL = "https://thongsukphonthong.github.io/price-list"
 DPI = 150
 EXPECTED_PAGES = 2
 PDF_OPTIONS = {
@@ -46,6 +45,9 @@ PDF_DIR = ROOT / "output_pdf"
 DOCS_DIR = ROOT / "docs"
 LINKS_FILE = ROOT / "links.txt"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_PREVIEW_BYTES = 1_000_000
+PREVIEW_DPI_OPTIONS = (96, 72, 54, 36)
+PREVIEW_QUALITY_OPTIONS = (85, 70, 55, 40)
 
 
 class ExportError(Exception):
@@ -71,14 +73,14 @@ def download_pdf(session: requests.Session, sheet_id: str, gid: str, name: str) 
     return response.content
 
 
-def render_pdf(pdf_bytes: bytes, name: str) -> list[Path]:
+def render_pdf(pdf_bytes: bytes, name: str) -> list[tuple[Path, Path]]:
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        document = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except (fitz.FileDataError, RuntimeError) as exc:
+        document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    except (pymupdf.FileDataError, RuntimeError) as exc:
         raise ExportError(f"Could not open the downloaded PDF for {name}: {exc}") from exc
 
-    paths: list[Path] = []
+    paths: list[tuple[Path, Path]] = []
     try:
         if len(document) != EXPECTED_PAGES:
             print(
@@ -87,6 +89,7 @@ def render_pdf(pdf_bytes: bytes, name: str) -> list[Path]:
             )
         for page_number, page in enumerate(document, start=1):
             output = DOCS_DIR / f"{name}_{page_number}.png"
+            preview_output = DOCS_DIR / f"{name}_{page_number}_preview.jpg"
             page.get_pixmap(dpi=DPI, alpha=False).save(output)
             size = output.stat().st_size
             if size > MAX_IMAGE_BYTES:
@@ -94,10 +97,26 @@ def render_pdf(pdf_bytes: bytes, name: str) -> list[Path]:
                     f"WARNING: {output.name} is {size / 1024 / 1024:.1f} MB; LINE limit is 10 MB.",
                     file=sys.stderr,
                 )
-            paths.append(output)
+            preview_size = create_preview(page, preview_output)
+            print(f"Preview {preview_output.name}: {preview_size / 1024:.0f} KB.")
+            paths.append((output, preview_output))
     finally:
         document.close()
     return paths
+
+
+def create_preview(page: pymupdf.Page, output: Path) -> int:
+    """Save a JPEG preview under LINE's 1 MiB preview image limit."""
+    for dpi in PREVIEW_DPI_OPTIONS:
+        pixmap = page.get_pixmap(dpi=dpi, alpha=False)
+        for quality in PREVIEW_QUALITY_OPTIONS:
+            jpeg_data = pixmap.tobytes("jpeg", jpg_quality=quality)
+            if len(jpeg_data) <= MAX_PREVIEW_BYTES:
+                output.write_bytes(jpeg_data)
+                return len(jpeg_data)
+    raise ExportError(
+        f"Could not reduce {output.name} below the 1 MB LINE preview limit."
+    )
 
 
 def run_git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -139,7 +158,7 @@ def main() -> int:
         return 1
 
     failures: list[str] = []
-    all_images: list[Path] = []
+    all_images: list[tuple[Path, Path]] = []
     PDF_DIR.mkdir(parents=True, exist_ok=True)
     with requests.Session() as session:
         session.headers["User-Agent"] = "PriceListExporter/1.0"
@@ -149,6 +168,8 @@ def main() -> int:
                 # public docs folder cannot silently present outdated prices.
                 for old_file in DOCS_DIR.glob(f"{name}_*.png"):
                     old_file.unlink()
+                for old_file in DOCS_DIR.glob(f"{name}_*_preview.jpg"):
+                    old_file.unlink()
                 if not gid or not re.fullmatch(r"\d+", gid):
                     raise ExportError(f"gid for {name} is not configured; fill it in SHEETS at the top of the script.")
                 data = download_pdf(session, sheet_id, gid, name)
@@ -156,16 +177,23 @@ def main() -> int:
                 pdf_path.write_bytes(data)
                 images = render_pdf(data, name)
                 all_images.extend(images)
-                print(f"Exported {name}: {pdf_path.name}, {len(images)} PNG page(s).")
+                print(f"Exported {name}: {pdf_path.name}, {len(images)} page(s) with previews.")
             except (ExportError, OSError) as exc:
                 failures.append(f"{name}: {exc}")
                 print(f"ERROR: {name}: {exc}", file=sys.stderr)
 
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
     (DOCS_DIR / ".nojekyll").touch()
-    timestamp = datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y%m%d%H%M")
+    # Thailand uses UTC+07:00 year-round; a fixed offset avoids requiring the
+    # optional IANA tzdata package on Windows.
+    bangkok_time = datetime.now(timezone(timedelta(hours=7)))
+    timestamp = bangkok_time.strftime("%Y%m%d%H%M")
     LINKS_FILE.write_text(
-        "".join(f"{BASE_URL}/{path.name}?v={timestamp}\n" for path in all_images),
+        "".join(
+            f"originalContentUrl: {BASE_URL}/{original.name}?v={timestamp}\n"
+            f"previewImageUrl: {BASE_URL}/{preview.name}?v={timestamp}\n\n"
+            for original, preview in all_images
+        ),
         encoding="utf-8",
     )
 
